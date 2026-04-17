@@ -37,6 +37,26 @@ def _rate_limit_wait(attempt: int, error: Exception) -> None:
     wait = min(60, (2 ** attempt) * (10 if is_rate_limit else 1))
     time.sleep(wait)
 
+
+def _extract_content(response) -> str:
+    """
+    Extrahuje text z LLM response.
+    Reasoning modely (Qwen3, DeepSeek-R1…) vrací content=None a myšlenky
+    v poli reasoning/reasoning_content. Fallbackujeme na reasoning pokud
+    content je None — ale ideálně by mělo být thinking zakázáno přes
+    reasoning_effort='none'.
+    """
+    msg = response.choices[0].message
+    content = msg.content
+    if content:
+        return content
+    # Fallback: reasoning pole (model nestihl vygenerovat output)
+    reasoning = getattr(msg, 'reasoning', None) or getattr(msg, 'reasoning_content', None)
+    if reasoning:
+        logging.warning("LLM vrátil content=None, používám reasoning pole jako fallback.")
+        return reasoning
+    return ""
+
 def count_tokens(text, model=None):
     if not text:
         return 0
@@ -55,8 +75,10 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                     model=model,
                     messages=messages,
                     temperature=0,
+                    reasoning_effort="none",  # vypne thinking u Qwen3/DeepSeek-R1
+                    max_tokens=4096,
                 )
-                content = response.choices[0].message.content
+                content = _extract_content(response)
                 if return_finish_reason:
                     finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
                     return content, finish_reason
@@ -86,8 +108,10 @@ async def llm_acompletion(model, prompt):
                     model=model,
                     messages=messages,
                     temperature=0,
+                    reasoning_effort="none",  # vypne thinking u Qwen3/DeepSeek-R1
+                    max_tokens=4096,
                 )
-                return response.choices[0].message.content
+                return _extract_content(response)
             except Exception as e:
                 print('************* Retrying *************')
                 logging.error(f"Error: {e}")
