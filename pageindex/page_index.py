@@ -5,6 +5,7 @@ import math
 import random
 import re
 from .utils import *
+from pageindex.prompt_config import prompt_config
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -102,7 +103,7 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
 
 
 def toc_detector_single_page(content, model=None):
-    prompt = f"""
+    _default = f"""
     Your job is to detect if there is a table of content provided in the given text.
 
     Given text: {content}
@@ -115,11 +116,37 @@ def toc_detector_single_page(content, model=None):
 
     Directly return the final JSON structure. Do not output anything else.
     Please note: abstract,summary, notation list, figure list, table list, etc. are not table of contents."""
+    prompt = prompt_config.get('toc_detector_single_page', _default)
+    if prompt_config.has('toc_detector_single_page'):
+        prompt = prompt.replace('{content}', content)
 
     response = llm_completion(model=model, prompt=prompt)
-    # print('response', response)
-    json_content = extract_json(response)    
+    json_content = extract_json(response)
     return json_content['toc_detected']
+
+
+async def toc_detector_single_page_async(content, model=None):
+    """Async varianta TOC detekce — umožňuje paralelní zpracování stránek přes asyncio.gather."""
+    _default = f"""
+    Your job is to detect if there is a table of content provided in the given text.
+
+    Given text: {content}
+
+    return the following JSON format:
+    {{
+        "thinking": <why do you think there is a table of content in the given text>
+        "toc_detected": "<yes or no>",
+    }}
+
+    Directly return the final JSON structure. Do not output anything else.
+    Please note: abstract,summary, notation list, figure list, table list, etc. are not table of contents."""
+    prompt = prompt_config.get('toc_detector_single_page', _default)
+    if prompt_config.has('toc_detector_single_page'):
+        prompt = prompt.replace('{content}', content)
+
+    response = await llm_acompletion(model=model, prompt=prompt)
+    json_content = extract_json(response)
+    return json_content.get('toc_detected', 'no')
 
 
 def check_if_toc_extraction_is_complete(content, toc, model=None):
@@ -339,16 +366,16 @@ def toc_transformer(toc_content, model=None):
 
 
 def find_toc_pages(start_page_index, page_list, opt, logger=None):
+    """Sync varianta — zachována pro zpětnou kompatibilitu."""
     print('start find_toc_pages')
     last_page_is_yes = False
     toc_page_list = []
     i = start_page_index
-    
+
     while i < len(page_list):
-        # Only check beyond max_pages if we're still finding TOC pages
         if i >= opt.toc_check_page_num and not last_page_is_yes:
             break
-        detected_result = toc_detector_single_page(page_list[i][0],model=opt.model)
+        detected_result = toc_detector_single_page(page_list[i][0], model=opt.model)
         if detected_result == 'yes':
             if logger:
                 logger.info(f'Page {i} has toc')
@@ -359,10 +386,61 @@ def find_toc_pages(start_page_index, page_list, opt, logger=None):
                 logger.info(f'Found the last page with toc: {i-1}')
             break
         i += 1
-    
+
     if not toc_page_list and logger:
         logger.info('No toc found')
-        
+
+    return toc_page_list
+
+
+async def find_toc_pages_async(start_page_index, page_list, opt, logger=None):
+    """
+    Async varianta TOC detekce — všechny stránky se kontrolují paralelně přes asyncio.gather.
+    Na vLLM jsou requesty automaticky dávkovány (continuous batching), místo sekvenčního
+    čekání na každou stránku zvlášť.
+
+    Early-stop logika je zachována: výsledky se vyhodnotí sekvenčně po skončení gather,
+    čímž se najde první súvislý blok TOC stránek.
+    """
+    print('start find_toc_pages_async')
+    end_index = min(len(page_list), opt.toc_check_page_num)
+    pages_to_check = list(range(start_page_index, end_index))
+
+    if not pages_to_check:
+        return []
+
+    # Paralelní detekce — vLLM batchuje všechny requesty najednou
+    tasks = [
+        toc_detector_single_page_async(page_list[i][0], model=opt.model)
+        for i in pages_to_check
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Sekvenční vyhodnocení výsledků — zachování early-stop logiky
+    toc_page_list = []
+    in_toc_block = False
+    for i, result in zip(pages_to_check, results):
+        if isinstance(result, Exception):
+            detected = 'no'
+            if logger:
+                logger.info(f'Error detecting TOC on page {i}: {result}')
+        else:
+            detected = result
+
+        if detected == 'yes':
+            if logger:
+                logger.info(f'Page {i} has toc')
+            toc_page_list.append(i)
+            in_toc_block = True
+        elif detected == 'no' and in_toc_block:
+            # První 'no' po bloku 'yes' — konec TOC
+            if logger:
+                logger.info(f'Found the last page with toc: {i - 1}')
+            break
+
+    if not toc_page_list and logger:
+        logger.info('No toc found')
+
     return toc_page_list
 
 def remove_page_number(data):
@@ -506,7 +584,7 @@ def remove_first_physical_index_section(text):
 ### add verify completeness
 def generate_toc_continue(toc_content, part, model=None):
     print('start generate_toc_continue')
-    prompt = """
+    _default_static = """
     You are an expert in extracting hierarchical tree structure.
     You are given a tree structure of the previous part and the text of the current part.
     Your task is to continue the tree structure from the previous part to include the current part.
@@ -516,10 +594,10 @@ def generate_toc_continue(toc_content, part, model=None):
     For the title, you need to extract the original title from the text, only fix the space inconsistency.
 
     The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X. \
-    
+
     For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
 
-    The response should be in the following format. 
+    The response should be in the following format.
         [
             {
                 "structure": <structure index, "x.x.x"> (string),
@@ -527,11 +605,11 @@ def generate_toc_continue(toc_content, part, model=None):
                 "physical_index": "<physical_index_X> (keep the format)"
             },
             ...
-        ]    
+        ]
 
     Directly return the additional part of the final JSON structure. Do not output anything else."""
-
-    prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
+    prompt = prompt_config.get('generate_toc_continue', _default_static)
+    prompt += '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
     if finish_reason == 'finished':
         return extract_json(response)
@@ -541,31 +619,31 @@ def generate_toc_continue(toc_content, part, model=None):
 ### add verify completeness
 def generate_toc_init(part, model=None):
     print('start generate_toc_init')
-    prompt = """
+    _default_static = """
     You are an expert in extracting hierarchical tree structure, your task is to generate the tree structure of the document.
 
     The structure variable is the numeric system which represents the index of the hierarchy section in the table of contents. For example, the first section has structure index 1, the first subsection has structure index 1.1, the second subsection has structure index 1.2, etc.
 
     For the title, you need to extract the original title from the text, only fix the space inconsistency.
 
-    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X. 
+    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X.
 
     For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
 
-    The response should be in the following format. 
+    The response should be in the following format.
         [
             {{
                 "structure": <structure index, "x.x.x"> (string),
                 "title": <title of the section, keep the original title>,
                 "physical_index": "<physical_index_X> (keep the format)"
             }},
-            
+
         ],
 
 
     Directly return the final JSON structure. Do not output anything else."""
-
-    prompt = prompt + '\nGiven text\n:' + part
+    prompt = prompt_config.get('generate_toc_init', _default_static)
+    prompt += '\nGiven text\n:' + part
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
 
     if finish_reason == 'finished':
@@ -693,8 +771,12 @@ def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
 
 
 
-def check_toc(page_list, opt=None):
-    toc_page_list = find_toc_pages(start_page_index=0, page_list=page_list, opt=opt)
+async def check_toc(page_list, opt=None):
+    """
+    Async varianta — používá find_toc_pages_async pro paralelní detekci TOC stránek.
+    Logika zůstává identická, pouze TOC detekce probíhá paralelně.
+    """
+    toc_page_list = await find_toc_pages_async(start_page_index=0, page_list=page_list, opt=opt)
     if len(toc_page_list) == 0:
         print('no toc found')
         return {'toc_content': None, 'toc_page_list': [], 'page_index_given_in_toc': 'no'}
@@ -707,17 +789,17 @@ def check_toc(page_list, opt=None):
             return {'toc_content': toc_json['toc_content'], 'toc_page_list': toc_page_list, 'page_index_given_in_toc': 'yes'}
         else:
             current_start_index = toc_page_list[-1] + 1
-            
-            while (toc_json['page_index_given_in_toc'] == 'no' and 
-                   current_start_index < len(page_list) and 
+
+            while (toc_json['page_index_given_in_toc'] == 'no' and
+                   current_start_index < len(page_list) and
                    current_start_index < opt.toc_check_page_num):
-                
-                additional_toc_pages = find_toc_pages(
+
+                additional_toc_pages = await find_toc_pages_async(
                     start_page_index=current_start_index,
                     page_list=page_list,
                     opt=opt
                 )
-                
+
                 if len(additional_toc_pages) == 0:
                     break
 
@@ -725,9 +807,9 @@ def check_toc(page_list, opt=None):
                 if additional_toc_json['page_index_given_in_toc'] == 'yes':
                     print('index found')
                     return {'toc_content': additional_toc_json['toc_content'], 'toc_page_list': additional_toc_pages, 'page_index_given_in_toc': 'yes'}
-
                 else:
                     current_start_index = additional_toc_pages[-1] + 1
+
             print('index not found')
             return {'toc_content': toc_json['toc_content'], 'toc_page_list': toc_page_list, 'page_index_given_in_toc': 'no'}
 
@@ -1027,7 +1109,7 @@ async def process_large_node_recursively(node, page_list, opt=None, logger=None)
     return node
 
 async def tree_parser(page_list, opt, doc=None, logger=None):
-    check_toc_result = check_toc(page_list, opt)
+    check_toc_result = await check_toc(page_list, opt)
     logger.info(check_toc_result)
 
     if check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result["page_index_given_in_toc"] == "yes":

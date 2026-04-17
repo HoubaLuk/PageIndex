@@ -16,6 +16,7 @@ import logging
 import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
+from pageindex.prompt_config import prompt_config
 
 # Backward compatibility: support CHATGPT_API_KEY as alias for OPENAI_API_KEY
 if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
@@ -58,7 +59,6 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return ""
 
 
-
 async def llm_acompletion(model, prompt):
     if model:
         model = model.removeprefix("litellm/")
@@ -80,7 +80,7 @@ async def llm_acompletion(model, prompt):
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
                 return ""
-            
+
             
 def get_json_content(response):
     start_idx = response.find("```json")
@@ -576,12 +576,15 @@ def add_node_text_with_labels(node, pdf_pages):
 
 
 async def generate_node_summary(node, model=None):
-    prompt = f"""You are given a part of a document, your task is to generate a description of the partial document about what are main points covered in the partial document.
+    _default = f"""You are given a part of a document, your task is to generate a description of the partial document about what are main points covered in the partial document.
 
     Partial Document Text: {node['text']}
-    
+
     Directly return the description, do not include any other text.
     """
+    prompt = prompt_config.get('generate_node_summary', _default)
+    if prompt_config.has('generate_node_summary'):
+        prompt = prompt.replace('{node_text}', node['text'])
     response = await llm_acompletion(model, prompt)
     return response
 
@@ -620,13 +623,16 @@ def create_clean_structure_for_description(structure):
 
 
 def generate_doc_description(structure, model=None):
-    prompt = f"""Your are an expert in generating descriptions for a document.
+    _default = f"""Your are an expert in generating descriptions for a document.
     You are given a structure of a document. Your task is to generate a one-sentence description for the document, which makes it easy to distinguish the document from other documents.
-        
+
     Document Structure: {structure}
-    
+
     Directly return the description, do not include any other text.
     """
+    prompt = prompt_config.get('generate_doc_description', _default)
+    if prompt_config.has('generate_doc_description'):
+        prompt = prompt.replace('{structure}', str(structure))
     response = llm_completion(model, prompt)
     return response
 
