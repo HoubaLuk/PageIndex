@@ -24,6 +24,11 @@ if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
 
 litellm.drop_params = True
 
+# Semaphore omezující souběžná LLM volání — chrání před překročením rate limitu.
+# Pro lokální vLLM lze zvýšit (concurrent batching zvládne desítky paralelně).
+# Pro OpenRouter free tier: max 3 souběžná volání.
+_LLM_SEMAPHORE = asyncio.Semaphore(3)
+
 def count_tokens(text, model=None):
     if not text:
         return 0
@@ -51,7 +56,10 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
-                time.sleep(1)
+                # Rate limit → čekáme déle (exponenciální backoff)
+                is_rate_limit = "rate" in str(e).lower() or "429" in str(e)
+                wait = min(60, (2 ** i) * (10 if is_rate_limit else 1))
+                time.sleep(wait)
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
                 if return_finish_reason:
@@ -64,22 +72,26 @@ async def llm_acompletion(model, prompt):
         model = model.removeprefix("litellm/")
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
-    for i in range(max_retries):
-        try:
-            response = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                temperature=0,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
-            if i < max_retries - 1:
-                await asyncio.sleep(1)
-            else:
-                logging.error('Max retries reached for prompt: ' + prompt)
-                return ""
+    async with _LLM_SEMAPHORE:
+        for i in range(max_retries):
+            try:
+                response = await litellm.acompletion(
+                    model=model,
+                    messages=messages,
+                    temperature=0,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                print('************* Retrying *************')
+                logging.error(f"Error: {e}")
+                if i < max_retries - 1:
+                    # Rate limit → čekáme déle (exponenciální backoff)
+                    is_rate_limit = "rate" in str(e).lower() or "429" in str(e)
+                    wait = min(60, (2 ** i) * (10 if is_rate_limit else 1))
+                    await asyncio.sleep(wait)
+                else:
+                    logging.error('Max retries reached for prompt: ' + prompt)
+                    return ""
 
             
 def get_json_content(response):
