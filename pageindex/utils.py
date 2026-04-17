@@ -8,6 +8,7 @@ import json
 import PyPDF2
 import copy
 import asyncio
+import threading
 import pymupdf
 from io import BytesIO
 from dotenv import load_dotenv
@@ -24,10 +25,17 @@ if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
 
 litellm.drop_params = True
 
-# Semaphore omezující souběžná LLM volání — chrání před překročením rate limitu.
-# Pro lokální vLLM lze zvýšit (concurrent batching zvládne desítky paralelně).
-# Pro OpenRouter free tier: max 3 souběžná volání.
-_LLM_SEMAPHORE = asyncio.Semaphore(3)
+# Thread-safe semaphore omezující souběžná LLM volání.
+# PageIndex běží v ThreadPoolExecutor → asyncio.Semaphore by nefungoval.
+# Pro lokální vLLM zvyšte na 10+; pro OpenRouter free tier: max 3.
+_LLM_SEMAPHORE = threading.Semaphore(3)
+
+
+def _rate_limit_wait(attempt: int, error: Exception) -> None:
+    """Exponenciální backoff — 10× delší pauza při rate limit chybě."""
+    is_rate_limit = "rate" in str(error).lower() or "429" in str(error)
+    wait = min(60, (2 ** attempt) * (10 if is_rate_limit else 1))
+    time.sleep(wait)
 
 def count_tokens(text, model=None):
     if not text:
@@ -40,31 +48,29 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
         model = model.removeprefix("litellm/")
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
-    for i in range(max_retries):
-        try:
-            response = litellm.completion(
-                model=model,
-                messages=messages,
-                temperature=0,
-            )
-            content = response.choices[0].message.content
-            if return_finish_reason:
-                finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
-                return content, finish_reason
-            return content
-        except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
-            if i < max_retries - 1:
-                # Rate limit → čekáme déle (exponenciální backoff)
-                is_rate_limit = "rate" in str(e).lower() or "429" in str(e)
-                wait = min(60, (2 ** i) * (10 if is_rate_limit else 1))
-                time.sleep(wait)
-            else:
-                logging.error('Max retries reached for prompt: ' + prompt)
+    with _LLM_SEMAPHORE:
+        for i in range(max_retries):
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=messages,
+                    temperature=0,
+                )
+                content = response.choices[0].message.content
                 if return_finish_reason:
-                    return "", "error"
-                return ""
+                    finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
+                    return content, finish_reason
+                return content
+            except Exception as e:
+                print('************* Retrying *************')
+                logging.error(f"Error: {e}")
+                if i < max_retries - 1:
+                    _rate_limit_wait(i, e)
+                else:
+                    logging.error('Max retries reached for prompt: ' + prompt)
+                    if return_finish_reason:
+                        return "", "error"
+                    return ""
 
 
 async def llm_acompletion(model, prompt):
@@ -72,7 +78,8 @@ async def llm_acompletion(model, prompt):
         model = model.removeprefix("litellm/")
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
-    async with _LLM_SEMAPHORE:
+    # threading.Semaphore — funguje i z ThreadPoolExecutor kde async primitiva nefungují
+    with _LLM_SEMAPHORE:
         for i in range(max_retries):
             try:
                 response = await litellm.acompletion(
@@ -85,10 +92,7 @@ async def llm_acompletion(model, prompt):
                 print('************* Retrying *************')
                 logging.error(f"Error: {e}")
                 if i < max_retries - 1:
-                    # Rate limit → čekáme déle (exponenciální backoff)
-                    is_rate_limit = "rate" in str(e).lower() or "429" in str(e)
-                    wait = min(60, (2 ** i) * (10 if is_rate_limit else 1))
-                    await asyncio.sleep(wait)
+                    _rate_limit_wait(i, e)
                 else:
                     logging.error('Max retries reached for prompt: ' + prompt)
                     return ""
